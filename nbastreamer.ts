@@ -1,6 +1,6 @@
 const { exec } = require("child_process");
 const { chromium } = require("playwright");
-
+const fs = require("fs");
 const axios = require("axios");
 const cheerio = require("cheerio");
 
@@ -18,7 +18,7 @@ async function fetchStreamEastLinks() {
         // Find all links and iterate through them
         $("a").each((index, element) => {
             const link = $(element).attr("href"); // Extract link
-            const text = $(element).text().trim().replace(/\n+/g, " "); // Extract text inside the link
+            const text = $(element).text().trim().replace(/\n+/g, " ").replace(/\s+/g, " ").trim(); // Extract text inside the link
 
             // Check if the text contains 'nba'
             if (text.toLowerCase().includes("nba") && text.includes("vs")) {
@@ -32,18 +32,30 @@ async function fetchStreamEastLinks() {
     }
 }
 
-(async () => {
+async function main({ filter }: { filter: string }) {
     const nbaLinks = (await fetchStreamEastLinks()) || [];
     console.log("Found:");
     nbaLinks?.forEach((l) => console.log("\t >" + l.text));
 
-    console.log("\nPicking " + nbaLinks[0].text + "\n" + nbaLinks[0].link);
-    const nbaLink = nbaLinks[0].link;
+    // Convert wildcard pattern to regex
+    const regexPattern = filter.replace(/\*/g, '.*');
+    const regex = new RegExp(regexPattern, 'i');
+
+    // Filter links based on the pattern
+    const filteredLinks = nbaLinks.filter(link => regex.test(link.text));
+
+    if (filteredLinks.length === 0) {
+        console.error("No matches found for filter:", filter);
+        process.exit(1);
+    }
+
+    console.log("\nPicking " + filteredLinks[0].text + "\n" + filteredLinks[0].link);
+    const nbaLink = filteredLinks[0].link;
 
     const browser = await chromium.launch({
         headless: true,
         executablePath: `/Applications/Google Chrome.app/Contents/MacOS/Google Chrome`,
-    }); // Set to false to see the browser actions
+    });
     const context = await browser.newContext();
     const page = await context.newPage();
 
@@ -52,53 +64,104 @@ async function fetchStreamEastLinks() {
 
     // Optional: Handle popups or advertisements
     // This is a simple example; you might need more complex handling depending on the popups
-    page.on("popup", async (popup) => {
+    page.on("popup", async (popup: any) => {
         await popup.close();
     });
 
-    // Wait for the play button within .play-wrapper to be available and click it
-    await page.waitForSelector(".play-wrapper");
+    // Wait for at least one iframe to appear
+    await page.waitForSelector('iframe');
 
-    // Detect and remove the element intercepting pointer events
-    await page.evaluate(() => {
-        // Get the bounding box of the element we want to click
-        const playWrapper = document.querySelector(".play-wrapper");
-        if (playWrapper) {
-            const rect = playWrapper.getBoundingClientRect();
-            // Find the topmost element at the center of the playWrapper
-            const x = rect.left + rect.width / 2;
-            const y = rect.top + rect.height / 2;
-            const elementAtPoint = document.elementFromPoint(x, y);
-            if (elementAtPoint && elementAtPoint !== playWrapper) {
-                // Hide or remove the intercepting element
-                elementAtPoint.remove();
+    // Get all frames (including main frame and all iframes)
+    const allFrames = page.frames();
+
+    // Find the iframe that contains a video element
+    const videoFrame = await (async () => {
+        for (const frame of allFrames) {
+            try {
+                const hasVideo = await frame.$$eval('video', (elements: Element[]) => elements.length > 0);
+                if (hasVideo) {
+                    return frame;
+                }
+            } catch (e) {
+                // Skip frames that we can't access
+                continue;
             }
         }
-    });
+        return null;
+    })();
 
-    await page.click(".play-wrapper");
+    if (!videoFrame) {
+        console.error("Could not find frame with video element");
+        process.exit(1);
+    }
 
-    // Wait for the video element to load the blob source and start playing
-    await page.waitForSelector('video[src^="blob:"]', { timeout: 60000 });
+    console.log("Selected frame URL:", videoFrame.url());
 
-    const m3u8Url = await new Promise(async (resolve) => {
-        page.on("request", (request) => {
-            const url: string = request.url();
-            if (url.endsWith(".m3u8")) {
-                resolve(url);
-            }
+    // Get all scripts in the selected frame
+    const scripts = await videoFrame.$$eval('script', (elements: Element[]) => {
+        return elements.map((script) => {
+            const scriptElement = script as HTMLScriptElement;
+            return {
+                src: scriptElement.src || 'inline script',
+                contentLength: scriptElement.textContent?.length || 0,
+                type: scriptElement.type || 'text/javascript',
+                textContent: scriptElement.textContent || ''
+            };
         });
     });
 
-    if (m3u8Url !== "ERROR") {
-        console.log("Found streaming video url:", m3u8Url);
-    } else {
-        console.log("M3U8 URL not found");
+    console.log("\nScripts in the selected frame:");
+    const decodedUrl = scripts.flatMap((script: any, index: number) => {
+
+
+        if (script.textContent?.includes("window.atob")) {
+            console.log("Found atob:", script.textContent);
+        }
+        const REGEX = /window\.atob\(['"](.*?)['"]\)/;
+        const match = script.textContent?.match(REGEX);
+        if (match) {
+            console.log("Found source:", match[1]);
+            const decodedUrl = atob(match[1]);
+            console.log("Decoded URL:", decodedUrl);
+            return [decodedUrl];
+        }
+        return [];
+    })[0];
+
+    if (!decodedUrl) {
+        console.error("No decoded URL found");
+        process.exit(1);
     }
+
+    const response = await axios.get(decodedUrl, {
+        maxRedirects: 0, // Don't follow redirects
+        validateStatus: (status: number) => status >= 200 && status < 400,
+    });
+
+    const playlistUrl = response.headers.location;
+
+    const FILE = [
+        "#EXTM3U",
+        "#EXTINF: -1,",
+        "#EXTVLCOPT:http-referrer=https://googlapisapi.com/",
+        playlistUrl
+    ]
+    const m3u8 = FILE.join("\n");
+    fs.writeFileSync("playlist.m3u8", m3u8);
+
 
     await browser.close();
 
+    console.log(`${__dirname}/playlist.m3u8`);
+
+
     console.log("Opening in VLC");
-    exec(`/Applications/VLC.app/Contents/MacOS/VLC ${m3u8Url}`);
+    exec(`/Applications/VLC.app/Contents/MacOS/VLC ${__dirname}/playlist.m3u8`);
     process.exit(0);
-})();
+}
+
+const filter = process.argv[2];
+
+main({
+    filter: filter || "*",
+});
